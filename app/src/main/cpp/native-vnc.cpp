@@ -7,6 +7,8 @@
  */
 
 #include <jni.h>
+#include <stdlib.h>
+#include <string.h>
 #include <GLES2/gl2.h>
 #include <rfb/rfbclient.h>
 
@@ -202,6 +204,75 @@ static rfbBool onHandleCursorPos(rfbClient *client, int x, int y) {
     return TRUE;
 }
 
+/**
+ * Applies 1-bit Floyd-Steinberg dithering to the dirty rectangle in the framebuffer.
+ *
+ * The framebuffer is in BGRA (32bpp) format. Luminance is computed per pixel,
+ * quantized to 0 or 255, and the quantization error is distributed to
+ * right, lower-left, lower, and lower-right neighbours using standard
+ * Floyd-Steinberg weights (7/16, 3/16, 5/16, 1/16).
+ *
+ * Error accumulation is done in a float scanline buffer that is updated
+ * as we walk left-to-right, top-to-bottom through the rectangle.
+ */
+static void applyFloydSteinbergDither(rfbClient *client, int x, int y, int w, int h) {
+    if (!client->frameBuffer || w <= 0 || h <= 0)
+        return;
+
+    const int fbWidth = client->width;
+    const int bpp = 4; // BGRA bytes per pixel
+
+    // Two error scanline buffers (w+2 floats each) so index col+1 covers col=-1..w.
+    const int errLen = w + 2;
+    float *errCur = (float *) calloc(errLen, sizeof(float));
+    float *errNxt = (float *) calloc(errLen, sizeof(float));
+    if (!errCur || !errNxt) {
+        free(errCur);
+        free(errNxt);
+        return;
+    }
+
+    for (int row = 0; row < h; ++row) {
+        memset(errNxt, 0, errLen * sizeof(float));
+
+        for (int col = 0; col < w; ++col) {
+            uint8_t *px = client->frameBuffer + ((y + row) * fbWidth + (x + col)) * bpp;
+
+            // BGRA: px[0]=B, px[1]=G, px[2]=R, px[3]=A
+            float luma = 0.299f * px[2] + 0.587f * px[1] + 0.114f * px[0];
+            float adjusted = luma + errCur[col + 1];
+
+            // Quantize to 1 bit
+            uint8_t quantized = (adjusted >= 128.0f) ? 255 : 0;
+            float error = adjusted - (float) quantized;
+
+            // Write back as grey (B=G=R=quantized), preserve alpha
+            px[0] = px[1] = px[2] = quantized;
+
+            // Distribute error: Floyd-Steinberg weights
+            errCur[col + 2] += error * (7.0f / 16.0f); // right
+            errNxt[col    ] += error * (3.0f / 16.0f); // lower-left
+            errNxt[col + 1] += error * (5.0f / 16.0f); // lower
+            errNxt[col + 2] += error * (1.0f / 16.0f); // lower-right
+        }
+
+        // Swap current and next error buffers
+        float *tmp = errCur;
+        errCur = errNxt;
+        errNxt = tmp;
+    }
+
+    free(errCur);
+    free(errNxt);
+}
+
+static void onGotFrameBufferUpdate(rfbClient *client, int x, int y, int w, int h) {
+    auto ex = getClientExtension(client);
+    LOCK(ex->mutex);
+    applyFloydSteinbergDither(client, x, y, w, h);
+    UNLOCK(ex->mutex);
+}
+
 static void onFinishedFrameBufferUpdate(rfbClient *client) {
     auto obj = getManagedClient(client);
     auto env = context.getEnv();
@@ -290,6 +361,7 @@ static void setCallbacks(rfbClient *client) {
     client->FinishedFrameBufferUpdate = onFinishedFrameBufferUpdate;
     client->MallocFrameBuffer = onMallocFrameBuffer;
     client->GotCursorShape = onGotCursorShape;
+    client->GotFrameBufferUpdate = onGotFrameBufferUpdate;
 }
 
 
