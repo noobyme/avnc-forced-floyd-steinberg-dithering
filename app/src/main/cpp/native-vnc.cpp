@@ -243,7 +243,7 @@ static void applyFloydSteinbergDither(rfbClient *client, int x, int y, int w, in
             float adjusted = luma + errCur[col + 1];
 
             // Quantize to 1 bit
-            uint8_t quantized = (adjusted >= 128.0f) ? 255 : 0;
+            uint8_t quantized = (adjusted >= 191.0f) ? 255 : 0;
             float error = adjusted - (float) quantized;
 
             // Write back as grey (B=G=R=quantized), preserve alpha
